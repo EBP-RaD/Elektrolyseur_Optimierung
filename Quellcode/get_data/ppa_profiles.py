@@ -5,8 +5,50 @@ import pandas as pd # Dataframe-Verarbeitung
 from io import StringIO #Wandelt json-strig in ein file-like object, das pd.read_json lesen kann
 from time import sleep # Pause zwischen Retry-Versuchen (bei fehlerhaften API-Aufrufen)
 from typing import Optional
+from datetime import datetime
 
 
+# Hilfsfunktion gegen Schaltjahrfehler
+
+def safe_replace_year(dt, new_year):
+    try:
+        return dt.replace(year=new_year)
+    except ValueError:
+        # Falls 29.Februar --> 28. Februar setzen
+        return dt.replace(year=new_year, day=28)
+
+# 1. Wetterjahr-Zuordnung (fest definiert)
+# Mapping zunächst im Code, später variabel durch Excel möglich
+
+WEATHER_MAPPING = {
+    2026: 2007,
+    2027: 2014,
+    2028: 2007,
+    2029: 2008,
+    2030: 2011,
+    2031: 2017,
+    2032: 2016,
+    2033: 2014,
+    2034: 2005,
+    2035: 2016,
+    2036: 2012,
+    2037: 2016,
+    2038: 2011,
+    2039: 2005,
+    2040: 2017,
+    2041: 2008,
+    2042: 2012,
+    2043: 2011,
+    2044: 2007,
+    2045: 2017,
+    2046: 2017,
+    2047: 2017,
+    2048: 2012,
+    2049: 2017,
+    2050: 2012,
+}
+
+# 2. Helper-Funktion: JSON mit Retry abrufen
 # Funktion versucht JSON-Daten von einer API abzurufen, wiederholt fehlgeschlagene Requests automatisch bis
 # ..zu retries-Mal und wirft einen Fehler, falls alles fehlschlägt
 def get_json_with_retries(session: requests.Session, url: str, params: dict, retries: int = 2, wait: float = 2)-> dict:
@@ -43,7 +85,7 @@ def get_json_with_retries(session: requests.Session, url: str, params: dict, ret
     # sollte nicht bis hierhin kommen
     raise RuntimeError("Unerwarteter Fehler in get_json_with_retries")
 
-
+# Hauptfunktion: PPA-Daten abrufen
 def get_ppa_data(
         token: str,                  
         start_year: int,              
@@ -76,12 +118,10 @@ def get_ppa_data(
     if mode not in ("mix", "pv", "wind"):
         raise ValueError("mode must be one of 'mix', 'pv', 'wind'")
     
-    if flatten and mode == "mix" and pv_share is None:
-        raise ValueError("pv_share must be provided when flatten=True and mode='mix'")
-    
     # API-Setup
     session = requests.Session()
     session.headers = {"Authorization": f"Token {token}"}
+
     base = "https://www.renewables.ninja/api/"
     pv_url = base + "data/pv"
     wind_url = base + "data/wind"
@@ -126,8 +166,9 @@ def get_ppa_data(
             if "data" not in pv_json or not pv_json["data"]:
                 raise RuntimeError(f"Keine PV-Daten für das Jahr {year}")
             pv_df = pd.read_json(StringIO(json.dumps(pv_json["data"])), orient="index")
-            pv_df.index = pd.to_datetime(pv_df.index, utc=True).tz_convert(tz)
-       
+            pv_df.index = pd.to_datetime(pv_df.index, utc=True)
+            # Änderung für Zeitstempel
+            
         
         # Wind
         if mode in ("wind", "mix"):
@@ -135,8 +176,11 @@ def get_ppa_data(
             if "data" not in wind_json or not wind_json["data"]:
                 raise RuntimeError(f"Keine Wind-Daten für das Jahr {year}")
             wind_df = pd.read_json(StringIO(json.dumps(wind_json["data"])), orient="index")
-            wind_df.index = pd.to_datetime(wind_df.index, utc=True).tz_convert(tz)
-  
+            
+            wind_df.index = pd.to_datetime(wind_df.index, utc=True)
+            # Änderung für Zeitstempel
+            
+
         frames= []
 
         if mode == "pv":
@@ -174,35 +218,50 @@ def get_ppa_data(
     result = pd.concat(all_years).reset_index(drop=True)
     result = result.sort_values("datetime").reset_index(drop=True)
 
-    if flatten:
-        # pv or wind -> unique mix exists, pick it
-        if mode in ("pv", "wind"):
-            unique_mix = result["mix"].unique()
-            if len(unique_mix) != 1:
-                raise RuntimeError("Erwartet genau einen Mix für pv/wind Modus")
-            return result[result["mix"] == unique_mix[0]][["datetime", "G_PPA_avail"]].reset_index(drop=True)
-                
-        # mix -> pv_share notwendig (oben validiert)
-        mix_name = f"pv{pv_share}_wind{100 - pv_share}"
-        if mix_name not in result["mix"].unique():
-            raise RuntimeError(f"Gewünschter Mix {mix_name} nicht in Ergebnis. Verfügbare mixes: {result['mix'].unique()}")
-        return result[result["mix"] == mix_name][["datetime", "G_PPA_avail"]].reset_index(drop=True)
+    result = result.pivot_table(
+        index=["datetime", "year", "hour"],
+        columns="mix",
+        values="G_PPA_avail"
+    ).reset_index()
+    result.columns.name = None # Spaltenname entfernen
     
     return result
 
-""" Beispiel
+# 4. Beispiel: Matching Optimierungsjahr -> Wetterjahr
 if __name__ == "__main__":
     TOKEN = "556c605e18c957326de4152532b694c483986f64"
 
-    # PV-Daten 2010, flach
-    df_pv = get_ppa_data(
-        token=TOKEN,
-        start_year=2025,
-        end_year=2025,
-        lat=52.52,
-        lon=13.405,
-        mode="wind",
-        flatten=True
-    )
-    print(df_pv.head(10))
-"""
+    # Optimierungsjahr für Test
+    requested_years = [2030]
+
+    all_profiles = []
+
+    # Mix-Anteile definieren (0, 25, 50, 75, 100)
+    mixes = [0, 25, 50, 75, 100]
+
+    for opt_year in requested_years:
+        weather_year = WEATHER_MAPPING[opt_year]
+
+        # PPA-Daten abrufen, Wide-Form automatisch
+        df_weather = get_ppa_data(
+            token=TOKEN,
+            start_year=weather_year,
+            end_year=weather_year,
+            lat=52.52,
+            lon=13.405,
+            mode="wind",
+            mixes=mixes
+        )
+
+        # Jahreszahlen auf Optimierungsjahr ändern
+        df_weather["year"] = opt_year
+        df_weather["datetime"] = df_weather["datetime"].apply(lambda dt: safe_replace_year(dt, opt_year))
+
+        all_profiles.append(df_weather)
+        print(f"Wetterjahr {weather_year} → Optimierungsjahr {opt_year}")
+
+    df_all = pd.concat(all_profiles).reset_index(drop=True)
+
+    # Ausgabe der ersten 5 Zeilen
+    print(df_all.head(10))
+
