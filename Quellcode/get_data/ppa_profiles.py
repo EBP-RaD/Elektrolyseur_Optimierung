@@ -1,12 +1,14 @@
+
 import os # Datei-/Pfadoperationen
 import requests # HTTP-Requests zur API
 import json #JSON-Parsing/Serialisierung
 import pandas as pd # Dataframe-Verarbeitung
+
 from io import StringIO #Wandelt json-strig in ein file-like object, das pd.read_json lesen kann
 from time import sleep # Pause zwischen Retry-Versuchen (bei fehlerhaften API-Aufrufen)
 from typing import Optional
 from datetime import datetime
-
+from Quellcode.get_data.ppa_config import PV_PARAMS, WIND_PARAMS
 
 # Hilfsfunktion gegen Schaltjahrfehler
 
@@ -126,23 +128,8 @@ def get_ppa_data(
     pv_url = base + "data/pv"
     wind_url = base + "data/wind"
 
-
-    # erstmal feste Parameter
-    pv_params = {
-        "capacity": 20.0,
-        "system_loss": 0.1,
-        "tracking": 0,
-        "tilt": 18,
-        "azim": 180,
-        "dataset": "merra2",
-        "format": "json"
-    }
-    wind_params = {
-        "capacity": 20.0,
-        "height": 100,
-        "turbine": "Vestas V90 2000",
-        "format": "json"
-    }
+    pv_params = PV_PARAMS.copy()
+    wind_params = WIND_PARAMS.copy()
 
     all_years = []
 
@@ -224,7 +211,8 @@ def get_ppa_data(
         values="G_PPA_avail"
     ).reset_index()
     result.columns.name = None # Spaltenname entfernen
-    
+
+    result.loc[:, result.columns.str.startswith("pv") | result.columns.str.startswith("wind")] /= 1000.0
     return result
 
 # 4. Beispiel: Matching Optimierungsjahr -> Wetterjahr

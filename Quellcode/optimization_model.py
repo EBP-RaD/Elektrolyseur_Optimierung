@@ -1,204 +1,163 @@
 import pandas as pd
 from ortools.linear_solver import pywraplp
 
-def run_optimization(h2_prices: pd.DataFrame, ppa_profiles: pd.DataFrame, da_prices: pd.DataFrame, params: dict):
+def run_optimization(df_all: pd.DataFrame, params: dict):
     """
     Führt das Optimierungsmodell für den Elektrolyseur aus.
-    ...
+    
+    Args:
+        df_all (pd.DataFrame): Stündlicher DataFrame aus load_data mit Spalten:
+            ["datetime", "DA_price", "h2_price", "G_PPA_avail", "year", "v"]
+        params (dict): Dictionary mit allen Modellparametern, z.B.
+            - P_max, P_min
+            - delta_t
+            - eta_ely
+            - p_ppa
+            - penalty
+    
+    Returns:
+        result_df: Optimale Stundenwerte für E_ely, P_ppa_used, B_grid, S_sell, H_prod, Z_penalty
+
     """
     print ("Optimierungsmodell wird gestartet...")
 
-    # 1. Solver initialisieren 
-    solver = pywraplp.Solver.CreateSolver("GLOP") # 'GLOP' ist der LP-Solver von Google
+    # - 1. Prüfung -
+    required_cols = ["datetime", "DA_price", "h2_price", "G_PPA_avail", "v"]
+    if not all (c in df_all.columns for c in required_cols):
+        raise ValueError(f"Fehlende Spalten in df_all. Erwartet: {required_cols}")
+    
+    # - 2. Solver initialisieren -
+    solver = pywraplp.Solver.CreateSolver("SCIP_MIXED_INTEGER_PROGRAMMING") # "SCIP" ist der MILP-Solver von Google
     if not solver:
-        print("Solver konnte nicht geladen werden.")
-        return None
-    print(f"Solver '{solver.Version()}' erfolgreich erstellt.") #oder solver.SolverVersioN()
+        raise RuntimeError("Solver konnte nicht erstellt werden.")
+    print(f"Solver '{solver.SolverVersion()}' erfolgreich geladen.")
 
-    # 2. Daten aufbereiten und in Dictionaries umwandeln
-    # Für eine bessere Performance wandel ich die Zeitreihen aus den Dataframes
-    # in Dicitionaries um. Das macht den Zugriff in den Schleifen viel schneller
+    # - 3. Zeitpunkte vorbereiten -
+    df_all = df_all.sort_values("datetime").reset_index(drop=True)
+    n = len(df_all)  
+    df_all["year"] = df_all["datetime"].dt.year
+    df_all["month"] = df_all["datetime"].dt.month
 
-    # Ich erstelle eine zentrale DataFrame für alle stündlichen Daten 
-    # und setzte den Dataframe-Index für die einfache Verknüpfung
-    df = ppa_profiles.set_index('datetime')
+    print(f"{n} Stunden für die Optimierung geladen.")
 
-    # Die monatlichen H2-Preise müssen jeder Stunde zugeordnet werden.
-    # Ich extrahiere Jahr und Monat aus dem Index von df.
-    df['year'] = df.index.year
-    df['month'] = df.index.month
+    # - 4. Variablen definieren - 
+    E_ely = [solver.NumVar(0, params['P_max'] * params['delta_t'], f"E_ely_{i}") for i in range(n)]
+    G_ppa_used = [solver.NumVar(0, solver.infinity(), f"G_ppa_used_{i}") for i in range(n)]
+    B_grid = [solver.NumVar(0, solver.infinity(), f"B_grid_{i}") for i in range(n)]
+    S_sell = [solver.NumVar(0, solver.infinity(), f"S_sell_{i}") for i in range(n)]
+    H_prod = [solver.NumVar(0, solver.infinity(), f"H_prod_{i}") for i in range(n)]
+    u = [solver.BoolVar(f"u_{i}") for i in range(n)]        # Ely an/aus
 
-    # Jetzt kann ich die H2-Preise an den Haupt-DataFrame anfügen (mergen).
-    df = pd.merge(df, h2_prices, on=['year', 'month'], how='left')
+    print(f"{6 * n} Variablen erstellt ({n} Stunden x 6 Variablen).")
 
-    # Platzhalter für Day-Ahead-Preise
-    # Sobald ich die da_prices habe, werden diese auf ähnliche Weise gemerged.
-    # Annahme: df_da hat eine 'datetime' und eine 'da_price' Spalte
-    if da_prices is not None:
-        df = pd.merge(df, da_prices.set_index('datetime'), left_index=True, right_index=True, how='left')
-    else:
-        # Wenn keine DA-Preise da sind, erstelle ich eine Platzhalter-Spalte mit Nullen
-        df['da_price'] = 0.0
-    #--------------------------------------
+    # - 5. Constraints - 
+    # --------------------------
+    # (1) Energiebilanz
+    # Für jede Stunde gilt: genutzter PPA-Strom + Zukauf aus Netz = Stromverbrauch des Elektrolyseurs
+    # keine Speicherung oder Verluste Berücksichtigt
 
-    # Erstelle eine Liste aller Zeitpunkte (Stunden) der Optimierung
-    time_steps = df.index
+    for i in range(n):
+        solver.Add(
+            E_ely[i] == G_ppa_used[i] + B_grid[i],
+        ) #--> Abwägen, ob <= besser/genauer ist
 
-    # Jetzt die finalen Dicionaries erstellen
-    ppa_avail = df['G_PPA_avail'].to_dict()
-    h2_price = df['h2_price'].to_dict()
-    da_price = df['da_price'].to_dict()
-
-    print(f"Daten für {len(time_steps)} Zeitpunkte aufbereitet.")
-
-    # 3. Entscheidungsvariablen deklarieren
-    # Ich erstelle für jede Variable ein Dictionary, das die Variablen-Objekte für jeden Zeitraum (t) speichert.
-
-    E_ely = {}
-    G_ppa_used = {}
-    B_grid = {}
-    S_sell = {}
-    H_prod = {}
-    Z_penalty = {}
-
-    # Ich loope durch jeden einzelnen Zeutpunkt (jede Stunde) der Optimierung
-    for t in time_steps:
-        # solver.NumVar(untere_Schranke, obere-Schranke. "name")
-        # ist diw OR-Tools Funktion, um eine kontinuierliche Variable zu erstellen.
-
-        # Gesamtverbrauch Elektrolyseur [MWh]
-        # Untere Schranke: 0, Obere Schranke: Die Maximale Leistung P_max
-        E_ely[t] = solver.NumVar(0, params['P_max'] * params['delta_t'], f'E_ely_{t}')
-
-        # Genutzter PPA-Strom [MWh]
-        G_ppa_used[t] = solver.NumVar(0, solver.infinity(), f'G_ppa_used_{t}')
-
-        # Zukauf aus dem Netz [MWh]
-        B_grid[t] = solver.NumVar(0, solver.infinity(), f'B_grid_{t}')
-
-        # Verkauf von PPA-Strom ins Netz [MWh]
-        S_sell[t] = solver.NumVar(0, solver.infinity(), f'S_sell_{t}')
-
-        # Produzierter Wasserstoff [MWh]
-        H_prod[t] = solver.NumVar(0, solver.infinity(), f'H_prod_{t}')
-
-        # Hilfsvariable für Mindestlast-Unterschreitung [MWh]
-        Z_penalty[t] = solver.NumVar(0, solver.infinity(), f'Z_penalty_{t}')
-
-    # Zähle die Dictionaries, die meine Variablentypen repräsentieren
-    num_variable_types = 6 # (E_ely, G_ppa_used, B_grid, S_sell, H_prod, Z_penalty)
-
-    print(f"{num_variable_types} Variablentypen für {len(time_steps)} Zeitpunkte erstellt.")
-
-    # Constraints definieren
-    # Ich loopen wieder durch jeden Zeitpunk, um die stündlichen Regeln festzulegen.
-    for t in time_steps:
-        # (1) Energie-Bilanz
-        solver.Add(E_ely[t] == G_ppa_used[t] + B_grid[t], f'Energiebilanz_{t}')
-
-        # (2) Umwandlung in Wasserstoff
-        solver.Add(H_prod[t] == E_ely[t] * params['eta_ely'], f'Umwandlung_{t}')
-
-        # (3) Maximal-Leistung:
-        # Dieser Constraint ist bereits durch die Definition der Variable E_ely[t] (mit P_max als oberer Schranke abgedeckt)
-
-        # (4) Mindestlast-Hilfsconstraint:
-        solver.Add(Z_penalty[t] >= params['P_min'] * params['delta_t'] - E_ely[t], f'Mindestlast_Hilfe_{t}')
-
-        # (5) Zukauf-Beschränkung
-        # Hier benötige ich die externen daten für v_y,h
-        # Da diese noch nicht vorliegen, lasse ich diesen Constraint vorerst raus
-        # solver.Add(B_grid[t] <= params['P_max'] * params['delta_t'] * v[t], f'Zukauf_{t}')
-
-        # 6a. Zeitraum-spezifische stündliche PPA-Constraints
-        if t.year < 2030:
-            # Stündlicher PPA-Verkauf: Verkauf ist nur bis zur Höhe der stündlich verfügbaren PPA-Menge möglich.
-            solver.Add(S_sell[t] <= ppa_avail[t], f'PPA-Verkauf_{t}')
-        else: # Jahre >= 2030
-            # Stündliche PPA-Verfügbarkeit (Nutzung + Verkauf):
-            # Genutzer und verkaufter Strom dürfen zusammen die verfügbare PPA-Menge
-            # in dieser Stunde nicht überschreiten
-            solver.Add(G_ppa_used[t] + S_sell[t] <= ppa_avail[t], f'PPA_Verfügbarkeit_{t}')
+    # (2) PPA-Verfügbarkeit
     
-    print("Allgemeingültige und stündliche PPA-Constraints wurden erstellt.") 
+    # Ab 2030: stündliche Beschränkung
+    # Vor 2030: monatliche Bilanzierung (Summe genutzt + verkauft <= Summe verfügbar)
 
-    # 6b. Zeitraum-spezifischer monatlicher PPA-Constraint
-    # Ich ermittle alle einzigartigen Jahr-Monat-Konbinationen
-    unique_months = df[['year', 'month']].drop_duplicates().to_records(index=False)
+    for i in range(n):
+        if df_all.loc[i, "year"] >= 2030:
+            solver.Add(G_ppa_used[i] <= df_all.loc[i, "G_PPA_avail"])
+            solver.Add(S_sell[i] <= df_all.loc[i, "G_PPA_avail"] - G_ppa_used[i])
+            
+    # Vor 2030: Monatsbilanz
+    for (y,m), group in df_all[df_all["year"] < 2030].groupby(["year", "month"]):
+        idx = group.index.tolist()
+        solver.Add(
+            solver.Sum(G_ppa_used[i] + S_sell[i] for i in idx)
+            <= group["G_PPA_avail"].sum(),
+        )
 
-    for year, month in unique_months:
-        # DIeser Constraint gilt nur für die Jahre vor 2030
-        if year < 2030:
-            # Finde alle Stunden, die zu diesem spezifischen Jahr und Monat gehören
-            hours_in_month = [t for t in time_steps if t.year == year and t.month == month]
+    # (3) Umwandlung Strom -> Wasserstoff
+    # Für jede Stunde: Erzeugter Wasserstoff = Stromverbrauch * Wirkungsgrad
+    # etwa_ely in Dezimalform, z.B. 0.7 -> später ggf. lastabhängig erweiterbar
 
-            if not hours_in_month:
-                continue    #überspringe diesen Monat, keine Daten vorhanden
+    for i in range(n):
+        solver.Add(
+            H_prod[i] == E_ely[i] * params["eta_ely"],
+        )
 
-            # Die Summe des genutzen PPA-Stroms in diesem Monat...
-            monthy_g_used = solver.Sum([G_ppa_used[t] for t in hours_in_month])
-
-            # ... darf nicht die Summe des verfügbaren PPA-Stroms in diesem Monat überschreiten
-            monthy_ppa_avail = sum(ppa_avail[t] for t in hours_in_month)
-
-            solver.Add(monthy_g_used <= monthy_ppa_avail, f'PPA-Monatsbudget_{year}-{month}')
-
-    print("Monatliche PPA-Constraints wurden erstellt.")
-
-    # 7. Zielfunktion definieren
-    # Ich erstelle eine Liste, die alle stündlichen Gewinn-und Verlustterme enthält.
-    objective_terms = []
-
-    for t in time_steps:
-        # Erlöse
-        revenue_h2 = h2_price[t] * H_prod[t]
-        revenue_sell = da_price[t] * S_sell[t]
-
-        # Kosten
-        cost_ppa = params['p_ppa'] * G_ppa_used[t]
-        cost_grid = da_price[t] * B_grid[t]
-        cost_penalty = params['strafe'] * Z_penalty[t]
-
-        # Füge den stündlichen Deckungsbeitrag zur Liste hnzu
-        objective_terms.append(revenue_h2 + revenue_sell - cost_ppa - cost_grid - cost_penalty)
+    # (4) Mindestlast und Maximallast
     
-    # Ich sage dem Solver, dass er die Summe aller Terme in dieser Liste maximieren soll
-    solver.Maximize(solver.Sum(objective_terms))
+    Pmin_dt = params["P_min"] * params["delta_t"]
+    Pmax_dt = params["P_max"] * params["delta_t"]
+    for i in range(n):
+        solver.Add(E_ely[i] >= Pmin_dt * u[i])
+        solver.Add(E_ely[i] <= Pmax_dt * u[i])
 
-    print("Zielfunktion wurde definiert.")
+    # (5) Zukaufbeschränkung
+    # Netzbezug (B_grid) ist nur erlaubt, wenn v = 1
+    # Wenn v = 0 -> B_grid muss 0 sein
+    # Wenn v = 1 -> B_grid kann bis zur Ely-Maximalleistung reichen
 
-    # 8. Solver starten und Ergebnisse auslesen
-    print("Starte den Solver...")
+    for i in range(n):
+        solver.Add(B_grid[i] <= params["P_max"] * params["delta_t"] * df_all.loc[i, "v"]) # --> Einfach erweiterbar, eventuell CO2-Preis-Kriterium
+        
+    # - 6. Zielfunktion: Erlösmaximierung -
+    # Ziel: Maximiere Gewinn = (H2-Erlöse + Überschussverkauf) - (Zukaufskosten + Strafkosten)
+
+    objective = solver.Objective()
+
+    for i in range(n):
+        # Einnahmen
+        objective.SetCoefficient(H_prod[i], df_all.loc[i, "h2_price"])
+        objective.SetCoefficient(S_sell[i], df_all.loc[i, "DA_price"])
+
+        # Kosten 
+        objective.SetCoefficient(B_grid[i], -df_all.loc[i, "DA_price"] - 0.001) # tierbreaker
+
+    # FESTE PPA-Kosten (pay-as-produced)
+    total_ppa_cost = params["p_ppa"] * float(df_all["G_PPA_avail"].sum())
+    objective.SetOffset(-total_ppa_cost)
+
+    # Zielfunktion maximieren
+    objective.SetMaximization()
+
+    # 6. Solver starten
+    print("Löse Optimierungsproblem...")
     status = solver.Solve()
 
-    # 9. Ergebnisse verarbeiten und zurückgeben
-    if status == pywraplp.Solver.OPTIMAL:
-        print(f"Lösung gefunden in {solver.wall_time()} Millisekunden")
-        print(f"Optimaler Gesamtgewinn {solver.Objective().Value:.2f} €")
+    if status != pywraplp.Solver.OPTIMAL:
+        print("Warnung: Kein optimales Ergebnis gefunden. Status:", status)
+    else:
+        print("Optimale Lösung gefunden!")
+    
+    # Ergebnisse extrahieren
+    results = pd.DataFrame({
+        "datetime": df_all["datetime"],
+        "DA_price": df_all["DA_price"],
+        "h2_price": df_all["h2_price"],
+        "G_PPA_avail": df_all["G_PPA_avail"],
+        "v": df_all["v"],
+        "E_ely": [E_ely[i].solution_value() for i in range(n)],
+        "G_ppa_used": [G_ppa_used[i].solution_value() for i in range(n)],
+        "B_grid": [B_grid[i].solution_value() for i in range(n)],
+        "S_sell": [S_sell[i].solution_value() for i in range(n)],
+        "H_prod": [H_prod[i].solution_value() for i in range(n)],
+        "u": [u[i].solution_value() for i in range(n)],
+    })
+    # Kleine numerische Rundungsfehler korrigieren:
+    results = results.round(10)
+    results["S_sell"] = results["S_sell"].clip(lower=0)
 
-        # Erstelle inen leeren DataFrame, um die Ergebnisse zu speichern
-        results_df = pd.DataFrame(index=time_steps)
-        df.index = pd.to_datetime(df.index).tz_convert("Europe/Berlin")
 
-        # Lies die optimalen Werte für jede Variable aus und füge sie zum DataFrame hinzu
-        for t in time_steps:
-            results_df.loc[t, 'E_ely'] = E_ely[t].solution_value()
-            results_df.loc[t, 'G_ppa_used'] = G_ppa_used[t].solution_value()
-            results_df.loc[t, 'B_grid'] = B_grid[t].solution_value()
-            results_df.loc[t, 'S_sell'] = S_sell[t].solution_value()
-            results_df.loc[t, 'H_prod'] = H_prod[t].solution_value()
-            results_df.loc[t, 'Z_penalty'] = Z_penalty[t].solution_value()
+    # Optimimalen Wert speichern (inkl. Offset)
+    results.attrs["objective_value"] = solver.Objective().Value()
+    print(f"Zielfunktionswert: {results.attrs['objective_value']:.2f} €")
 
-        return results_df
-
-    elif status ==pywraplp.Solver.FEASIBLE:
-        print("Eine möglihe, aber nicht garantiert optimale Lösung wurde gefunden.")
-        # Ich könnte hier trotzdem die Ergebnisse auslesen, wenn notwendig.
-        return None
-    else: 
-        print("Der Solver konnte keine Lösung finden.")
-        return None
-
+    return results  
+    
 
 
 
